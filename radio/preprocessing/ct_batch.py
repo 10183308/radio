@@ -357,7 +357,13 @@ class CTImagesBatch(Batch):  # pylint: disable=too-many-public-methods
             # convert components_blosc to iterable
             components = np.asarray(components).reshape(-1)
 
-            self._load_blosc(components=components)              # pylint: disable=no-value-for-parameter
+            self._load_blosc(components=components)              # pylint: disable=no-value-for-parameter    
+        elif fmt == 'blosc2':
+            components = self.components if components is None else components
+            # convert components_blosc to iterable
+            components = np.asarray(components).reshape(-1)
+
+            self._load_blosc2(components=components)              # pylint: disable=no-value-for-parameter
         elif fmt == 'raw':
             self._load_raw()                # pylint: disable=no-value-for-parameter
         else:
@@ -445,7 +451,7 @@ class CTImagesBatch(Batch):  # pylint: disable=too-many-public-methods
             skysc_shape = (self._bounds[-1], shapes[0, 1], shapes[0, 2])
             setattr(self, component, np.zeros(skysc_shape))
 
-    def _init_load_blosc(self, **kwargs):
+    def _init_load_blosc2(self, **kwargs):
         """ Init-function for load from blosc.
 
         Parameters
@@ -464,7 +470,64 @@ class CTImagesBatch(Batch):  # pylint: disable=too-many-public-methods
 
         return self.indices
 
-    @inbatch_parallel(init='_init_load_blosc', post='_post_default', target='async', update=False)
+    @inbatch_parallel(init='_init_load_blosc2', post='_post_load_blosc', target='async', update=False)
+    async def _read_blosc(self, ix, *args, **kwargs):
+        byted = dict()
+        for source in kwargs['components']:
+            if source in ['spacing', 'origin']:
+                ext = 'pkl'
+            else:
+                ext = 'blk'
+            comp_path = os.path.join(self.index.get_fullpath(ix), source, 'data' + '.' + ext)
+            if not os.path.exists(comp_path):
+                raise OSError("File with component {} doesn't exist".format(source))
+
+            # read the component
+            async with aiofiles.open(comp_path, mode='rb') as file:
+                byted[source] = await file.read()
+        return byted
+
+    def _post_load_blosc(self, list_of_arrs, **kwargs):
+        self._reraise_worker_exceptions(list_of_arrs)
+        self.byted = dict(zip(self.indices, list_of_arrs))    
+    
+
+    @inbatch_parallel(init='indices', post='_post_default', target='threads', update=False)
+    def _debyte_blosc(self, ix, **kwargs):
+        for source in kwargs['components']:
+            # set correct extension for each component and choose a tool
+            # for debyting and (possibly) decoding it
+            if source in ['spacing', 'origin']:
+                ext = 'pkl'
+                unpacker = pickle.loads
+            else:
+                ext = 'blk'
+                def unpacker(byted):
+                    """ Debyte and decode an ndarray
+                    """
+                    debyted = blosc.unpack_array(byted)
+
+                    # read the decoder and apply it
+                    decod_path = os.path.join(self.index.get_fullpath(ix), source, 'data.decoder')
+
+                    # if file with decoder not exists, assume that no decoding is needed
+                    if os.path.exists(decod_path):
+                        with open(decod_path, mode='rb') as file:
+                            decoder = pickle.loads(file.read())
+                    else:
+                        decoder = lambda x: x
+
+                    return decoder(debyted)
+            component = unpacker(self.byted[ix][source])
+            # update needed slice(s) of component
+            comp_pos = self.get_pos(None, source, ix)
+            getattr(self, source)[comp_pos] = component
+
+    def _load_blosc2(self, **kwargs):
+        self._read_blosc(**kwargs)
+        self._debyte_blosc(**kwargs)
+
+    @inbatch_parallel(init='_init_load_blosc2', post='_post_default', target='async', update=False)
     async def _load_blosc(self, ix, *args, **kwargs):
         """ Read scans from blosc and put them into batch components
 
@@ -493,7 +556,6 @@ class CTImagesBatch(Batch):  # pylint: disable=too-many-public-methods
                     """ Debyte and decode an ndarray
                     """
                     debyted = blosc.unpack_array(byted)
-
                     # read the decoder and apply it
                     decod_path = os.path.join(self.index.get_fullpath(ix), source, 'data.decoder')
 
@@ -503,13 +565,13 @@ class CTImagesBatch(Batch):  # pylint: disable=too-many-public-methods
                             decoder = pickle.loads(file.read())
                     else:
                         decoder = lambda x: x
-
-                    return decoder(debyted)
+                    res = decoder(debyted)
+                    return res
 
             comp_path = os.path.join(self.index.get_fullpath(ix), source, 'data' + '.' + ext)
             if not os.path.exists(comp_path):
                 raise OSError("File with component {} doesn't exist".format(source))
-
+            
             # read the component
             async with aiofiles.open(comp_path, mode='rb') as file:
                 byted = await file.read()
